@@ -102,9 +102,9 @@ export default function GestionaleMagazzino() {
     setSaving(true);
     try {
       const ok = await window.storage.set('gestionale-db', JSON.stringify(next), false);
-      if (!ok) showToast('Errore nel salvataggio dei dati', 'error');
+      if (!ok) showToast('Errore nel salvataggio dei dati: operazione non confermata dal server', 'error');
     } catch (e) {
-      showToast('Errore nel salvataggio dei dati', 'error');
+      showToast(`Errore nel salvataggio dei dati: ${e && e.message ? e.message : 'errore sconosciuto'}`, 'error');
     } finally {
       setSaving(false);
     }
@@ -1708,6 +1708,7 @@ function SupplierModal({ supplier, onClose, onSave }) {
 function BackupTab({ db, persist, showToast, askConfirm }) {
   const [backups, setBackups] = useState([]);
   const [loadingBackups, setLoadingBackups] = useState(true);
+  const [jsonModalOpen, setJsonModalOpen] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => { loadBackupsList(); }, []);
@@ -1718,6 +1719,7 @@ function BackupTab({ db, persist, showToast, askConfirm }) {
       const res = await window.storage.get('backups-list', false);
       setBackups(res && res.value ? JSON.parse(res.value) : []);
     } catch (e) {
+      // Chiave non ancora creata (nessun backup salvato finora): comportamento atteso, non è un errore da segnalare.
       setBackups([]);
     } finally {
       setLoadingBackups(false);
@@ -1727,14 +1729,32 @@ function BackupTab({ db, persist, showToast, askConfirm }) {
   async function saveBackupSnapshot() {
     const id = uid();
     const label = new Date().toLocaleString('it-IT');
+    const snapshot = JSON.stringify(db);
+    const sizeMB = snapshot.length / (1024 * 1024);
+
+    if (sizeMB > 4.5) {
+      showToast(`Backup troppo grande (${sizeMB.toFixed(1)} MB, limite 5 MB): usa "Scarica JSON" per un backup esterno invece dello storico interno`, 'error');
+      return;
+    }
+
+    // Passo 1: salva lo snapshot completo su una chiave dedicata
     try {
-      await window.storage.set(`backup:${id}`, JSON.stringify(db), false);
-      const list = [{ id, label, count: db.articles.length }, ...backups].slice(0, 20);
-      await window.storage.set('backups-list', JSON.stringify(list), false);
+      const res1 = await window.storage.set(`backup:${id}`, snapshot, false);
+      if (!res1) throw new Error('il server non ha confermato il salvataggio');
+    } catch (e) {
+      showToast(`Errore nel salvataggio dello snapshot: ${e && e.message ? e.message : 'errore sconosciuto'}. Prova a usare "Scarica JSON" come alternativa.`, 'error');
+      return;
+    }
+
+    // Passo 2: aggiorna l'elenco dei backup (chiave separata, per evitare di riscrivere ogni volta tutti gli snapshot)
+    try {
+      const list = [{ id, label, count: db.articles.length }, ...backups].slice(0, 15);
+      const res2 = await window.storage.set('backups-list', JSON.stringify(list), false);
+      if (!res2) throw new Error('il server non ha confermato l\'aggiornamento');
       setBackups(list);
       showToast('Backup salvato con successo');
     } catch (e) {
-      showToast('Errore nel salvataggio del backup', 'error');
+      showToast(`Snapshot salvato, ma l'elenco backup non si è aggiornato (${e && e.message ? e.message : 'errore'}). Il backup esiste comunque, riprova per vederlo in elenco.`, 'warn');
     }
   }
 
@@ -1745,19 +1765,12 @@ function BackupTab({ db, persist, showToast, askConfirm }) {
         const restored = { ...emptyDB(), ...JSON.parse(res.value) };
         persist(restored);
         showToast('Backup ripristinato');
+      } else {
+        showToast('Backup non trovato: potrebbe essere stato rimosso', 'error');
       }
     } catch (e) {
-      showToast('Errore nel ripristino del backup', 'error');
+      showToast(`Errore nel ripristino del backup: ${e && e.message ? e.message : 'errore sconosciuto'}`, 'error');
     }
-  }
-
-  function downloadJSON() {
-    const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `backup_magazzino_${todayStr()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   function handleRestoreFile(e) {
@@ -1849,7 +1862,7 @@ function BackupTab({ db, persist, showToast, askConfirm }) {
           <p className="text-xs text-slate-500 mb-3">Salva uno snapshot dei dati nello storage persistente, oppure scaricalo come file JSON da conservare offline.</p>
           <div className="flex gap-2 flex-wrap">
             <button className={btnPrimary} onClick={saveBackupSnapshot}><Save size={14} /> Salva backup ora</button>
-            <button className={btnSecondary} onClick={downloadJSON}><Download size={14} /> Scarica JSON</button>
+            <button className={btnSecondary} onClick={() => setJsonModalOpen(true)}><Download size={14} /> Scarica JSON</button>
           </div>
         </div>
 
@@ -1890,6 +1903,75 @@ function BackupTab({ db, persist, showToast, askConfirm }) {
           )}
         </div>
       </div>
+      {jsonModalOpen && <ExportJsonModal db={db} onClose={() => setJsonModalOpen(false)} showToast={showToast} />}
     </div>
   );
 }
+
+function ExportJsonModal({ db, onClose, showToast }) {
+  const jsonText = useMemo(() => JSON.stringify(db, null, 2), [db]);
+  const [url, setUrl] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const textareaRef = useRef(null);
+
+  useEffect(() => {
+    const blob = new Blob([jsonText], { type: 'application/json' });
+    const objUrl = URL.createObjectURL(blob);
+    setUrl(objUrl);
+    return () => URL.revokeObjectURL(objUrl);
+  }, [jsonText]);
+
+  function copyToClipboard() {
+    const done = () => { setCopied(true); showToast('Dati copiati negli appunti'); setTimeout(() => setCopied(false), 2500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(jsonText).then(done).catch(() => selectAndCopyFallback());
+    } else {
+      selectAndCopyFallback();
+    }
+  }
+
+  function selectAndCopyFallback() {
+    if (textareaRef.current) {
+      textareaRef.current.select();
+      try {
+        document.execCommand('copy');
+        showToast('Dati copiati negli appunti');
+      } catch (e) {
+        showToast('Copia automatica non riuscita: seleziona il testo manualmente (Ctrl/Cmd+A poi Ctrl/Cmd+C)', 'error');
+      }
+    }
+  }
+
+  return (
+    <Modal title="Esporta backup JSON" onClose={onClose} wide>
+      <p className="text-xs text-slate-500 mb-3">
+        Clicca su "Scarica il file" qui sotto. Se il download automatico non parte (può succedere nell'ambiente di anteprima),
+        usa "Copia negli appunti" e incolla il testo in un editor (Blocco Note, TextEdit...), salvandolo con estensione <code className="bg-slate-100 px-1 rounded">.json</code>.
+      </p>
+      <div className="flex gap-2 mb-3">
+        {url && (
+          <a
+            href={url}
+            download={`backup_magazzino_${todayStr()}.json`}
+            className={btnPrimary}
+            style={{ textDecoration: 'none' }}
+          >
+            <Download size={14} /> Scarica il file
+          </a>
+        )}
+        <button className={btnSecondary} onClick={copyToClipboard}>
+          {copied ? <Check size={14} /> : <FileDown size={14} />} {copied ? 'Copiato!' : 'Copia negli appunti'}
+        </button>
+      </div>
+      <textarea
+        ref={textareaRef}
+        readOnly
+        value={jsonText}
+        onClick={(e) => e.target.select()}
+        className="w-full h-64 text-[11px] font-mono border border-slate-300 rounded-md p-2 bg-slate-50"
+      />
+      <p className="text-[11px] text-slate-400 mt-2">{(jsonText.length / 1024).toFixed(1)} KB di dati</p>
+    </Modal>
+  );
+}
+
