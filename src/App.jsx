@@ -1100,8 +1100,9 @@ function CaricoModal({ db, onClose, onSubmit }) {
 
 /* ============================== TRASFERIMENTI ============================== */
 
-function TrasferimentiTab({ db, persist, showToast }) {
+function TrasferimentiTab({ db, persist, showToast, askConfirm }) {
   const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
   const [filterFrom, setFilterFrom] = useState('');
   const [filterTo, setFilterTo] = useState('');
   const allTrasferimenti = groupMovements(db.movements.filter(m => m.type === 'trasferimento'));
@@ -1110,6 +1111,12 @@ function TrasferimentiTab({ db, persist, showToast }) {
     if (filterFrom && from !== filterFrom) return false;
     if (filterTo && to !== filterTo) return false;
     return true;
+  });
+  // refId dei trasferimenti che sono stati generati come "annullo" di un altro trasferimento
+  const reversalOfMap = {};
+  allTrasferimenti.forEach(t => {
+    const rev = t.items[0]?.reversalOfRefId;
+    if (rev) reversalOfMap[rev] = t.refId;
   });
 
   function submitTrasferimento({ date, whFrom, whTo, lines, note }) {
@@ -1136,6 +1143,91 @@ function TrasferimentiTab({ db, persist, showToast }) {
     persist(next);
     showToast(`Trasferimento registrato: ${lines.length} articoli`);
     setOpen(false);
+    return true;
+  }
+
+  function annullaTrasferimento(t) {
+    const from = t.items[0]?.whFrom, to = t.items[0]?.whTo;
+    askConfirm(
+      `Annullare il trasferimento del ${t.date} da ${WH_MAP[from]?.label} a ${WH_MAP[to]?.label}? Verrà creato un trasferimento inverso automatico di ${t.items.length} articoli.`,
+      () => {
+        // controllo disponibilità nel magazzino di destinazione originale (ora punto di partenza dell'inverso)
+        for (const l of t.items) {
+          const disp = getQty(db, to, l.articleId);
+          if (l.qty > disp) {
+            const art = db.articles.find(a => a.id === l.articleId);
+            showToast(`Impossibile annullare: quantità insufficiente di "${art?.descrizione || l.articleId}" in ${WH_MAP[to]?.label} (disponibili ${disp}, richiesti ${l.qty})`, 'error');
+            return;
+          }
+        }
+        const refId = uid();
+        const next = { ...db, movements: [...db.movements], stock: { ...db.stock } };
+        t.items.forEach(l => {
+          const kFrom = stockKey(to, l.articleId);
+          const kTo = stockKey(from, l.articleId);
+          next.stock[kFrom] = (next.stock[kFrom] || 0) - l.qty;
+          next.stock[kTo] = (next.stock[kTo] || 0) + l.qty;
+          next.movements.push({
+            id: uid(), refId, date: todayStr(), type: 'trasferimento', articleId: l.articleId, wh: null,
+            whFrom: to, whTo: from, qty: l.qty,
+            note: `Annullo trasferimento del ${t.date}`, reversalOfRefId: t.refId, createdAt: Date.now()
+          });
+        });
+        persist(next);
+        showToast('Trasferimento annullato: creato il movimento inverso');
+      },
+      true
+    );
+  }
+
+  // db "virtuale" con la giacenza ripristinata come se il trasferimento in modifica non fosse mai avvenuto,
+  // così il modal mostra correttamente le disponibilità durante la modifica
+  const editingRevertedDb = editing ? (() => {
+    const stock = { ...db.stock };
+    editing.items.forEach(l => {
+      const kFrom = stockKey(l.whFrom, l.articleId);
+      const kTo = stockKey(l.whTo, l.articleId);
+      stock[kFrom] = (stock[kFrom] || 0) + l.qty;
+      stock[kTo] = (stock[kTo] || 0) - l.qty;
+    });
+    return { ...db, stock };
+  })() : null;
+
+  function submitModificaTrasferimento(original, { date, whFrom, whTo, lines, note }) {
+    // ripristina la giacenza come se il trasferimento originale non fosse mai avvenuto
+    const reverted = { ...db.stock };
+    original.items.forEach(l => {
+      const kFrom = stockKey(l.whFrom, l.articleId);
+      const kTo = stockKey(l.whTo, l.articleId);
+      reverted[kFrom] = (reverted[kFrom] || 0) + l.qty;
+      reverted[kTo] = (reverted[kTo] || 0) - l.qty;
+    });
+    // controllo disponibilità con la giacenza ripristinata
+    for (const l of lines) {
+      const disp = reverted[stockKey(whFrom, l.articleId)] || 0;
+      if (Number(l.qty) > disp) {
+        const art = db.articles.find(a => a.id === l.articleId);
+        showToast(`Quantità insufficiente per "${art?.descrizione || l.articleId}" in ${WH_MAP[whFrom].label} (disponibili ${disp})`, 'error');
+        return false;
+      }
+    }
+    const reversalTag = original.items[0]?.reversalOfRefId;
+    const newStock = { ...reverted };
+    const newItems = lines.map(l => {
+      const kFrom = stockKey(whFrom, l.articleId);
+      const kTo = stockKey(whTo, l.articleId);
+      newStock[kFrom] = (newStock[kFrom] || 0) - Number(l.qty);
+      newStock[kTo] = (newStock[kTo] || 0) + Number(l.qty);
+      return {
+        id: uid(), refId: original.refId, date, type: 'trasferimento', articleId: l.articleId, wh: null, whFrom, whTo,
+        qty: Number(l.qty), note, ...(reversalTag ? { reversalOfRefId: reversalTag } : {}), createdAt: Date.now(), editedAt: Date.now()
+      };
+    });
+    const remainingMovements = db.movements.filter(m => m.refId !== original.refId);
+    const next = { ...db, movements: [...remainingMovements, ...newItems], stock: newStock };
+    persist(next);
+    showToast('Trasferimento aggiornato');
+    setEditing(null);
     return true;
   }
 
@@ -1191,34 +1283,68 @@ function TrasferimentiTab({ db, persist, showToast }) {
               <th className="text-left px-3 py-2">A</th>
               <th className="text-right px-3 py-2">Righe</th>
               <th className="text-left px-3 py-2">Note</th>
+              <th className="text-right px-3 py-2">Azioni</th>
             </tr>
           </thead>
           <tbody>
-            {trasferimenti.map(t => (
-              <tr key={t.refId} className="border-t border-slate-100 hover:bg-slate-50">
-                <td className="px-3 py-2">{t.date}</td>
-                <td className="px-3 py-2">{WH_MAP[t.items[0]?.whFrom]?.label}</td>
-                <td className="px-3 py-2">{WH_MAP[t.items[0]?.whTo]?.label}</td>
-                <td className="px-3 py-2 text-right">{t.items.length}</td>
-                <td className="px-3 py-2 text-slate-500">{t.items[0]?.note}</td>
-              </tr>
-            ))}
+            {trasferimenti.map(t => {
+              const isReversal = !!t.items[0]?.reversalOfRefId;
+              const cancelledBy = reversalOfMap[t.refId];
+              return (
+                <tr key={t.refId} className="border-t border-slate-100 hover:bg-slate-50">
+                  <td className="px-3 py-2">{t.date}</td>
+                  <td className="px-3 py-2">{WH_MAP[t.items[0]?.whFrom]?.label}</td>
+                  <td className="px-3 py-2">{WH_MAP[t.items[0]?.whTo]?.label}</td>
+                  <td className="px-3 py-2 text-right">{t.items.length}</td>
+                  <td className="px-3 py-2 text-slate-500">
+                    {t.items[0]?.note}
+                    {isReversal && <span className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] bg-amber-100 text-amber-700">Annullo</span>}
+                    {cancelledBy && <span className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] bg-slate-200 text-slate-600">Annullato</span>}
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    {!cancelledBy && (
+                      <div className="flex justify-end gap-3">
+                        <button
+                          className="text-xs text-blue-600 hover:text-blue-800 underline"
+                          onClick={() => setEditing(t)}
+                        >
+                          Modifica
+                        </button>
+                        <button
+                          className="text-xs text-red-600 hover:text-red-800 underline"
+                          onClick={() => annullaTrasferimento(t)}
+                        >
+                          Annulla
+                        </button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
         {trasferimenti.length === 0 && <EmptyState text={filterFrom || filterTo ? "Nessun trasferimento corrisponde ai filtri selezionati" : "Nessun trasferimento registrato"} icon={ArrowLeftRight} />}
       </div>
 
-      {open && <TrasferimentoModal db={db} onClose={() => setOpen(false)} onSubmit={submitTrasferimento} />}
+      {(open || editing) && (
+        <TrasferimentoModal
+          db={editing ? editingRevertedDb : db}
+          initial={editing}
+          onClose={() => { setOpen(false); setEditing(null); }}
+          onSubmit={editing ? (payload) => submitModificaTrasferimento(editing, payload) : submitTrasferimento}
+        />
+      )}
     </div>
   );
 }
 
-function TrasferimentoModal({ db, onClose, onSubmit }) {
-  const [date, setDate] = useState(todayStr());
-  const [whFrom, setWhFrom] = useState('generale');
-  const [whTo, setWhTo] = useState('padel');
-  const [note, setNote] = useState('');
-  const [lines, setLines] = useState([]);
+function TrasferimentoModal({ db, onClose, onSubmit, initial }) {
+  const [date, setDate] = useState(initial ? initial.date : todayStr());
+  const [whFrom, setWhFrom] = useState(initial ? initial.items[0].whFrom : 'generale');
+  const [whTo, setWhTo] = useState(initial ? initial.items[0].whTo : 'padel');
+  const [note, setNote] = useState(initial ? (initial.items[0].note || '') : '');
+  const [lines, setLines] = useState(initial ? initial.items.map(l => ({ articleId: l.articleId, qty: l.qty })) : []);
   const [scan, setScan] = useState('');
   const { byEan, byCode } = useArticleMaps(db);
 
@@ -1239,7 +1365,7 @@ function TrasferimentoModal({ db, onClose, onSubmit }) {
   const canSubmit = lines.length > 0 && lines.every(l => Number(l.qty) > 0) && whFrom !== whTo;
 
   return (
-    <Modal title="Nuovo trasferimento" onClose={onClose} wide>
+    <Modal title={initial ? "Modifica trasferimento" : "Nuovo trasferimento"} onClose={onClose} wide>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
         <Field label="Data"><input type="date" className={inputCls} value={date} onChange={e => setDate(e.target.value)} /></Field>
         <Field label="Da">
@@ -1308,7 +1434,7 @@ function TrasferimentoModal({ db, onClose, onSubmit }) {
           disabled={!canSubmit || lines.some(l => Number(l.qty) > getQty(db, whFrom, l.articleId))}
           onClick={() => onSubmit({ date, whFrom, whTo, lines, note })}
         >
-          <Check size={14} /> Registra trasferimento
+          <Check size={14} /> {initial ? "Salva modifiche" : "Registra trasferimento"}
         </button>
       </div>
     </Modal>
