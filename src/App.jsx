@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Package, Warehouse, Truck, ArrowLeftRight, ClipboardList,
   History, AlertTriangle, Users, FileDown, Save, Search, Plus, Trash2,
   Edit2, X, Check, Upload, Download, ScanLine, ChevronDown, RotateCcw,
-  ShieldCheck, Menu
+  ShieldCheck, Menu, ShoppingCart
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -45,6 +45,15 @@ const fmtNum = (n) => (Number(n) || 0).toLocaleString('it-IT');
 
 function stockKey(wh, articleId) { return `${wh}:${articleId}`; }
 
+function normalizeMatchText(s) {
+  return String(s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // rimuove accenti
+    .toUpperCase()
+    .replace(/['".,]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function emptyDB() {
   return {
     version: 1,
@@ -53,6 +62,7 @@ function emptyDB() {
     stock: {},      // "wh:articleId" -> qty
     movements: [],  // {id, date, type, articleId, wh, whFrom, whTo, qty, note, documento, fornitoreId, prezzoAcquisto, refId, createdAt}
     inventories: [], // {id, date, wh, note, items:[{articleId, teorica, reale, diff}], createdAt}
+    posAliases: {}, // "descrizione normalizzata da cassa" -> articleId (memorizza le corrispondenze confermate durante l'import vendite)
   };
 }
 
@@ -133,6 +143,7 @@ export default function GestionaleMagazzino() {
     { id: 'magazzino', label: 'Magazzino', icon: Warehouse },
     { id: 'carichi', label: 'Carichi', icon: Truck },
     { id: 'trasferimenti', label: 'Trasferimenti', icon: ArrowLeftRight },
+    { id: 'vendite', label: 'Vendite', icon: ShoppingCart },
     { id: 'inventario', label: 'Inventario', icon: ClipboardList },
     { id: 'movimenti', label: 'Movimenti', icon: History },
     { id: 'riordino', label: 'Riordino', icon: AlertTriangle },
@@ -188,6 +199,7 @@ export default function GestionaleMagazzino() {
           {tab === 'magazzino' && <MagazzinoTab {...ctx} />}
           {tab === 'carichi' && <CarichiTab {...ctx} />}
           {tab === 'trasferimenti' && <TrasferimentiTab {...ctx} />}
+          {tab === 'vendite' && <VenditeTab {...ctx} />}
           {tab === 'inventario' && <InventarioTab {...ctx} />}
           {tab === 'movimenti' && <MovimentiTab {...ctx} />}
           {tab === 'riordino' && <RiordinoTab {...ctx} />}
@@ -718,13 +730,30 @@ function MagazzinoTab({ db }) {
   const [wh, setWh] = useState('generale');
   const [search, setSearch] = useState('');
 
+  const activeArticles = db.articles.filter(a => a.attivo !== false);
+  const valueByWarehouse = WAREHOUSES.map(w => ({
+    ...w,
+    value: activeArticles.reduce((s, a) => s + getQty(db, w.id, a.id) * (Number(a.prezzoAcquisto) || 0), 0)
+  }));
+
   const rows = db.articles.filter(a => a.attivo !== false && (
     !search || [a.codice, a.descrizione, a.ean].some(f => (f || '').toLowerCase().includes(search.toLowerCase()))
   )).sort((a, b) => (a.descrizione || '').localeCompare(b.descrizione || ''));
 
+  const totaleWh = rows.reduce((s, a) => s + getQty(db, wh, a.id) * (Number(a.prezzoAcquisto) || 0), 0);
+
   return (
     <div>
       <PageHeader title="Magazzino — Giacenze" subtitle="Stato giacenze in tempo reale per magazzino" />
+
+      <div className="flex flex-wrap gap-3 mb-4">
+        {valueByWarehouse.map(w => (
+          <div key={w.id} className="flex-1 min-w-[160px]">
+            <Card label={w.label} value={fmtMoney(w.value)} icon={Warehouse} />
+          </div>
+        ))}
+      </div>
+
       <div className="flex flex-wrap gap-2 mb-3">
         {WAREHOUSES.map(w => (
           <button key={w.id} onClick={() => setWh(w.id)}
@@ -766,6 +795,15 @@ function MagazzinoTab({ db }) {
               );
             })}
           </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr className="border-t-2 border-slate-200 bg-slate-50 font-semibold">
+                <td className="px-3 py-2" colSpan={4}>Totale {WH_MAP[wh]?.label}</td>
+                <td className="px-3 py-2 text-right">{fmtMoney(totaleWh)}</td>
+                <td className="px-3 py-2"></td>
+              </tr>
+            </tfoot>
+          )}
         </table>
         {rows.length === 0 && <EmptyState text="Nessun articolo" icon={Warehouse} />}
       </div>
@@ -1441,6 +1479,549 @@ function TrasferimentoModal({ db, onClose, onSubmit, initial }) {
   );
 }
 
+/* ============================== VENDITE (scarico da report cassa) ============================== */
+
+function periodoLabel(item) {
+  if (!item) return '—';
+  if (item.periodoDa && item.periodoA && item.periodoDa !== item.periodoA) {
+    return `${item.periodoDa} → ${item.periodoA}`;
+  }
+  return item.periodoA || item.date || '—';
+}
+
+function VenditeTab({ db, persist, showToast, askConfirm }) {
+  const [open, setOpen] = useState(false);
+  const [view, setView] = useState('storico'); // 'storico' | 'statistiche'
+  const [expanded, setExpanded] = useState(null);
+  const [filterWh, setFilterWh] = useState('');
+  const allScarichi = groupMovements(db.movements.filter(m => m.type === 'scarico'));
+  const scarichi = allScarichi.filter(s => !filterWh || s.wh === filterWh);
+
+  // refId degli scarichi che sono stati annullati (marcati da un carico di storno)
+  const cancelledRefIds = new Set(
+    db.movements.filter(m => m.type === 'carico' && m.reversalOfRefId).map(m => m.reversalOfRefId)
+  );
+
+  function annullaScarico(s) {
+    askConfirm(
+      `Annullare l'importazione vendite del ${periodoLabel(s.items[0])} su ${WH_MAP[s.wh]?.label} (${s.items.length} articoli)? La merce verrà ripristinata in giacenza con un movimento di storno.`,
+      () => {
+        const refId = uid();
+        const next = { ...db, movements: [...db.movements], stock: { ...db.stock } };
+        s.items.forEach(l => {
+          const key = stockKey(s.wh, l.articleId);
+          next.stock[key] = (next.stock[key] || 0) + l.qty;
+          next.movements.push({
+            id: uid(), refId, date: todayStr(), type: 'carico', articleId: l.articleId, wh: s.wh, whFrom: null, whTo: s.wh,
+            qty: l.qty, prezzoAcquisto: l.prezzoAcquisto, documento: '', fornitoreId: '',
+            note: `Storno importazione vendite del ${s.date}`, reversalOfRefId: s.refId, createdAt: Date.now()
+          });
+        });
+        persist(next);
+        showToast('Importazione vendite annullata: merce ripristinata in giacenza');
+      },
+      true
+    );
+  }
+
+  function exportExcel() {
+    const rows = [];
+    scarichi.forEach(s => s.items.forEach(m => {
+      const art = db.articles.find(a => a.id === m.articleId);
+      rows.push({
+        Periodo: periodoLabel(s.items[0]), Magazzino: WH_MAP[s.wh]?.label || '', Codice: art?.codice, Descrizione: art?.descrizione,
+        QuantitaVenduta: m.qty, ValoreAcquisto: m.qty * (Number(m.prezzoAcquisto) || 0), Note: m.note || ''
+      });
+    }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Vendite');
+    XLSX.writeFile(wb, `vendite_${todayStr()}.xlsx`);
+  }
+
+  return (
+    <div>
+      <PageHeader title="Vendite — Scarico da report cassa" subtitle="Importa il report del registratore di cassa per scaricare automaticamente le quantità vendute dalla giacenza del chiosco.">
+        {view === 'storico' && scarichi.length > 0 && <button className={btnSecondary} onClick={exportExcel}><FileDown size={14} /> Esporta Excel</button>}
+        <button className={btnPrimary} onClick={() => setOpen(true)}><Upload size={14} /> Importa vendite</button>
+      </PageHeader>
+
+      <div className="flex flex-wrap gap-2 mb-3">
+        <button onClick={() => setView('storico')} className={`px-3 py-1.5 rounded-md text-sm border ${view === 'storico' ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-600 border-slate-300'}`}>Storico importazioni</button>
+        <button onClick={() => setView('statistiche')} className={`px-3 py-1.5 rounded-md text-sm border ${view === 'statistiche' ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-600 border-slate-300'}`}>Statistiche</button>
+      </div>
+
+      {view === 'statistiche' ? (
+        <StatisticheVenditeSection db={db} cancelledRefIds={cancelledRefIds} />
+      ) : (
+      <>
+      <div className="flex flex-wrap gap-2 mb-3">
+        <button onClick={() => setFilterWh('')} className={`px-3 py-1.5 rounded-md text-sm border ${filterWh === '' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-300'}`}>Tutti</button>
+        {WAREHOUSES.filter(w => w.id !== 'generale').map(w => (
+          <button key={w.id} onClick={() => setFilterWh(w.id)}
+            className={`px-3 py-1.5 rounded-md text-sm border ${filterWh === w.id ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-300'}`}>
+            {w.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="bg-white rounded-lg border border-slate-200 overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="bg-slate-50 text-slate-500 text-[11px] uppercase">
+            <tr>
+              <th className="w-6"></th>
+              <th className="text-left px-3 py-2">Data</th>
+              <th className="text-left px-3 py-2">Chiosco</th>
+              <th className="text-right px-3 py-2">Righe</th>
+              <th className="text-right px-3 py-2">Valore scaricato</th>
+              <th className="text-left px-3 py-2">Note</th>
+              <th className="text-right px-3 py-2">Azioni</th>
+            </tr>
+          </thead>
+          <tbody>
+            {scarichi.map(s => {
+              const isOpen = expanded === s.refId;
+              const cancelled = cancelledRefIds.has(s.refId);
+              const total = s.items.reduce((sum, i) => sum + i.qty * (Number(i.prezzoAcquisto) || 0), 0);
+              return (
+                <React.Fragment key={s.refId}>
+                  <tr className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" onClick={() => setExpanded(isOpen ? null : s.refId)}>
+                    <td className="px-2 py-2 text-slate-400"><ChevronDown size={14} className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} /></td>
+                    <td className="px-3 py-2">{periodoLabel(s.items[0])}</td>
+                    <td className="px-3 py-2">{WH_MAP[s.wh]?.label}</td>
+                    <td className="px-3 py-2 text-right">{s.items.length}</td>
+                    <td className="px-3 py-2 text-right font-medium">{fmtMoney(total)}</td>
+                    <td className="px-3 py-2 text-slate-500">
+                      {s.items[0]?.note}
+                      {cancelled && <span className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] bg-slate-200 text-slate-600">Annullato</span>}
+                    </td>
+                    <td className="px-3 py-2 text-right" onClick={e => e.stopPropagation()}>
+                      {!cancelled && (
+                        <button className="text-xs text-red-600 hover:text-red-800 underline" onClick={() => annullaScarico(s)}>
+                          Annulla
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                  {isOpen && (
+                    <tr className="bg-slate-50/60">
+                      <td colSpan={7} className="px-3 py-2">
+                        <table className="w-full text-xs bg-white rounded-md border border-slate-200 overflow-hidden">
+                          <thead className="text-slate-500 text-[11px] uppercase bg-slate-50">
+                            <tr>
+                              <th className="text-left px-2 py-1.5">Articolo</th>
+                              <th className="text-right px-2 py-1.5 w-28">Quantità venduta</th>
+                              <th className="text-right px-2 py-1.5 w-28">Valore</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {s.items.map(item => {
+                              const art = db.articles.find(a => a.id === item.articleId);
+                              return (
+                                <tr key={item.id} className="border-t border-slate-100">
+                                  <td className="px-2 py-1.5">{art?.codice} — {art?.descrizione}</td>
+                                  <td className="px-2 py-1.5 text-right font-medium">{fmtNum(item.qty)} {art?.unita}</td>
+                                  <td className="px-2 py-1.5 text-right">{fmtMoney(item.qty * (Number(item.prezzoAcquisto) || 0))}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+        {scarichi.length === 0 && <EmptyState text="Nessuna importazione vendite registrata" icon={ShoppingCart} />}
+      </div>
+      </>
+      )}
+
+      {open && <ImportVenditeModal db={db} persist={persist} showToast={showToast} onClose={() => setOpen(false)} />}
+    </div>
+  );
+}
+
+function StatisticheVenditeSection({ db, cancelledRefIds }) {
+  const [wh, setWh] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  const scaricoMovs = db.movements.filter(m =>
+    m.type === 'scarico' &&
+    !cancelledRefIds.has(m.refId) &&
+    (!wh || m.wh === wh) &&
+    (!dateFrom || m.date >= dateFrom) &&
+    (!dateTo || m.date <= dateTo)
+  );
+
+  // Top prodotti
+  const byArticle = {};
+  scaricoMovs.forEach(m => {
+    if (!byArticle[m.articleId]) byArticle[m.articleId] = { qty: 0, value: 0 };
+    byArticle[m.articleId].qty += m.qty;
+    byArticle[m.articleId].value += m.qty * (Number(m.prezzoAcquisto) || 0);
+  });
+  const topProdotti = Object.entries(byArticle).map(([articleId, v]) => {
+    const art = db.articles.find(a => a.id === articleId);
+    return {
+      articleId, codice: art?.codice || '—', descrizione: art?.descrizione || 'Articolo eliminato',
+      unita: art?.unita || '', qty: v.qty, value: v.value
+    };
+  }).sort((a, b) => b.qty - a.qty).slice(0, 15);
+
+  // Vendite per giorno della settimana
+  const WEEKDAY_LABELS = ['Domenica', 'Lunedì', 'Martedì', 'Mercoledì', 'Giovedì', 'Venerdì', 'Sabato'];
+  const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+  const byWeekday = {};
+  scaricoMovs.forEach(m => {
+    const idx = new Date(`${m.date}T00:00:00`).getDay();
+    if (!byWeekday[idx]) byWeekday[idx] = { qty: 0, dates: new Set() };
+    byWeekday[idx].qty += m.qty;
+    byWeekday[idx].dates.add(m.date);
+  });
+  const weekdayData = WEEKDAY_ORDER.map(idx => {
+    const e = byWeekday[idx];
+    const qty = e ? e.qty : 0;
+    const giorni = e ? e.dates.size : 0;
+    return { giorno: WEEKDAY_LABELS[idx], media: giorni > 0 ? +(qty / giorni).toFixed(1) : 0, totale: qty, giorniConDati: giorni };
+  });
+  const hasWeekdayData = weekdayData.some(d => d.giorniConDati > 0);
+
+  return (
+    <div>
+      <div className="flex flex-wrap gap-2 mb-4 items-end">
+        <Field label="Chiosco" className="w-48">
+          <select className={inputCls} value={wh} onChange={e => setWh(e.target.value)}>
+            <option value="">Tutti i chioschi</option>
+            {WAREHOUSES.filter(w => w.id !== 'generale').map(w => <option key={w.id} value={w.id}>{w.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Dal" className="w-40">
+          <input type="date" className={inputCls} value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+        </Field>
+        <Field label="Al" className="w-40">
+          <input type="date" className={inputCls} value={dateTo} onChange={e => setDateTo(e.target.value)} />
+        </Field>
+      </div>
+
+      {scaricoMovs.length === 0 ? (
+        <EmptyState text="Nessun dato di vendita nel periodo/chiosco selezionato" icon={ShoppingCart} />
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div className="bg-white rounded-lg border border-slate-200 p-4">
+            <div className="text-sm font-semibold text-slate-700 mb-3">Prodotti più venduti {wh ? `— ${WH_MAP[wh].label}` : '(tutti i chioschi)'}</div>
+            <ResponsiveContainer width="100%" height={Math.max(220, topProdotti.length * 32)}>
+              <BarChart data={topProdotti} layout="vertical" margin={{ left: 10, right: 20 }}>
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                <XAxis type="number" allowDecimals={false} />
+                <YAxis type="category" dataKey="descrizione" width={140} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(v, name) => name === 'qty' ? [fmtNum(v), 'Quantità'] : [fmtMoney(v), 'Valore']} />
+                <Bar dataKey="qty" fill="#2563eb" radius={[0, 4, 4, 0]} name="Quantità" />
+              </BarChart>
+            </ResponsiveContainer>
+            <table className="w-full text-xs mt-3">
+              <thead className="text-slate-500 text-[11px] uppercase">
+                <tr><th className="text-left py-1">Articolo</th><th className="text-right py-1">Qtà</th><th className="text-right py-1">Valore</th></tr>
+              </thead>
+              <tbody>
+                {topProdotti.map(p => (
+                  <tr key={p.articleId} className="border-t border-slate-100">
+                    <td className="py-1">{p.codice} — {p.descrizione}</td>
+                    <td className="py-1 text-right font-medium">{fmtNum(p.qty)} {p.unita}</td>
+                    <td className="py-1 text-right">{fmtMoney(p.value)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="bg-white rounded-lg border border-slate-200 p-4">
+            <div className="text-sm font-semibold text-slate-700 mb-1">Vendite per giorno della settimana</div>
+            <div className="text-[11px] text-slate-400 mb-3">Quantità media venduta per giorno (basata sulle giornate con almeno un'importazione)</div>
+            {hasWeekdayData ? (
+              <>
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={weekdayData}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="giorno" tick={{ fontSize: 11 }} />
+                    <YAxis allowDecimals={false} />
+                    <Tooltip formatter={(v, name, props) => [`${fmtNum(v)} (${props.payload.giorniConDati} giorni monitorati)`, 'Media']} />
+                    <Bar dataKey="media" fill="#0d9488" radius={[4, 4, 0, 0]} name="Media giornaliera" />
+                  </BarChart>
+                </ResponsiveContainer>
+                <table className="w-full text-xs mt-2">
+                  <thead className="text-slate-500 text-[11px] uppercase">
+                    <tr><th className="text-left py-1">Giorno</th><th className="text-right py-1">Media</th><th className="text-right py-1">Totale periodo</th><th className="text-right py-1">Gg. monitorati</th></tr>
+                  </thead>
+                  <tbody>
+                    {weekdayData.map(d => (
+                      <tr key={d.giorno} className="border-t border-slate-100">
+                        <td className="py-1">{d.giorno}</td>
+                        <td className="py-1 text-right font-medium">{fmtNum(d.media)}</td>
+                        <td className="py-1 text-right">{fmtNum(d.totale)}</td>
+                        <td className="py-1 text-right text-slate-400">{d.giorniConDati}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            ) : <EmptyState text="Dati insufficienti" icon={ShoppingCart} />}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ImportVenditeModal({ db, persist, showToast, onClose }) {
+  const [wh, setWh] = useState('padel');
+  const [dateFrom, setDateFrom] = useState(todayStr());
+  const [dateTo, setDateTo] = useState(todayStr());
+  const [fileName, setFileName] = useState('');
+  const [rows, setRows] = useState(null); // parsed + matched rows
+  const [overrides, setOverrides] = useState({}); // indice riga -> articleId scelto manualmente ('' = nessuno)
+
+  function matchArticle(codiceRaw, eanRaw, descRaw) {
+    const codice = String(codiceRaw || '').trim().toLowerCase();
+    const ean = String(eanRaw || '').trim().toLowerCase();
+    const descNorm = normalizeMatchText(descRaw);
+    // 1. corrispondenza già confermata in precedenza per questa esatta descrizione di cassa
+    if (descNorm && db.posAliases && db.posAliases[descNorm]) {
+      const aliased = db.articles.find(a => a.id === db.posAliases[descNorm]);
+      if (aliased) return aliased;
+    }
+    if (codice) {
+      const byCode = db.articles.find(a => (a.codice || '').toLowerCase() === codice);
+      if (byCode) return byCode;
+    }
+    if (ean) {
+      const byEan = db.articles.find(a => (a.ean || '').toLowerCase() === ean);
+      if (byEan) return byEan;
+    }
+    if (descNorm) {
+      const exact = db.articles.find(a => normalizeMatchText(a.descrizione) === descNorm);
+      if (exact) return exact;
+      // corrispondenza parziale: la descrizione della cassa (spesso troncata) è contenuta in quella del gestionale o viceversa
+      if (descNorm.length >= 4) {
+        const partial = db.articles.find(a => {
+          const an = normalizeMatchText(a.descrizione);
+          return an && (an.includes(descNorm) || descNorm.includes(an));
+        });
+        if (partial) return partial;
+      }
+    }
+    return null;
+  }
+
+  function parseRowDate(val, fallbackYear, boundStart, boundEnd) {
+    let d = null;
+    if (val instanceof Date && !isNaN(val.getTime())) {
+      d = val;
+    } else if (typeof val === 'string' && val.trim()) {
+      const m = val.trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+      if (m) {
+        let [, dd, mm, yy] = m;
+        if (yy.length === 2) yy = '20' + yy;
+        d = new Date(Number(yy), Number(mm) - 1, Number(dd));
+      } else {
+        const parsed = new Date(val);
+        if (!isNaN(parsed.getTime())) d = parsed;
+      }
+    }
+    if (!d || isNaN(d.getTime())) return null;
+    // corregge l'anno se il file riporta un anno palesemente sbagliato (bug comune di alcuni registratori di cassa)
+    if (fallbackYear && Math.abs(d.getFullYear() - fallbackYear) > 1) {
+      d = new Date(fallbackYear, d.getMonth(), d.getDate());
+    }
+    // corregge un'eventuale inversione giorno/mese (comune quando il giorno è ≤12), usando l'intervallo Dal/Al come riferimento
+    if (boundStart && boundEnd) {
+      const inRange = (dt) => dt.getTime() >= boundStart.getTime() && dt.getTime() <= boundEnd.getTime();
+      if (!inRange(d) && d.getDate() <= 12) {
+        const swapped = new Date(d.getFullYear(), d.getDate() - 1, d.getMonth() + 1);
+        if (!isNaN(swapped.getTime()) && inRange(swapped)) d = swapped;
+      }
+    }
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setFileName(file.name);
+    const fallbackYear = Number((dateTo || todayStr()).slice(0, 4));
+    const boundStart = dateFrom ? new Date(`${dateFrom}T00:00:00`) : null;
+    const boundEnd = dateTo ? new Date(`${dateTo}T23:59:59`) : null;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const wbFile = XLSX.read(evt.target.result, { type: 'binary', cellDates: true });
+        const ws = wbFile.Sheets[wbFile.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+        // 1. estrae ogni riga del file
+        const raw = json.map(r => {
+          const codice = r.Codice ?? r.codice ?? r.Cod ?? r.SKU ?? r.Barcode ?? '';
+          const ean = r.EAN ?? r.ean ?? r.Barcode ?? '';
+          const descrizione = r.Descrizione ?? r.descrizione ?? r.Prodotto ?? r.Articolo ?? r.Piatto ?? '';
+          const qtyRaw = r.Quantita ?? r.Quantità ?? r.Qta ?? r['Qtà'] ?? r.QuantitaVenduta ?? r.Venduto ?? r.Pezzi ?? r.Qty ?? 0;
+          const qty = Math.abs(Number(String(qtyRaw).replace(',', '.')) || 0);
+          const dateRaw = r.Data ?? r['Data do'] ?? r.DataVendita ?? r['Data Vendita'] ?? r['Data vendita'] ?? r.Date ?? r.Giorno ?? '';
+          const rowDate = parseRowDate(dateRaw, fallbackYear, boundStart, boundEnd) || dateTo;
+          return { codice: String(codice || '').trim(), ean, descrizione: String(descrizione || '').trim(), qty, rowDate };
+        }).filter(r => r.qty > 0 && r.descrizione);
+
+        // 2. aggrega per data + prodotto, per non creare un movimento per ogni singolo scontrino
+        const groups = {};
+        raw.forEach(r => {
+          const key = `${r.rowDate}||${normalizeMatchText(r.descrizione)}||${r.codice.toLowerCase()}`;
+          if (!groups[key]) groups[key] = { codiceFile: r.codice, descrizioneFile: r.descrizione, rowDate: r.rowDate, qty: 0, ean: r.ean };
+          groups[key].qty += r.qty;
+        });
+        const parsed = Object.values(groups).map(g => ({
+          ...g, matched: matchArticle(g.codiceFile, g.ean, g.descrizioneFile)
+        })).sort((a, b) => a.rowDate.localeCompare(b.rowDate) || a.descrizioneFile.localeCompare(b.descrizioneFile));
+
+        setRows(parsed);
+        setOverrides({});
+      } catch (err) {
+        showToast('Errore nella lettura del file. Verifica che sia un Excel o CSV valido.', 'error');
+      }
+    };
+    reader.readAsBinaryString(file);
+  }
+
+  // articolo effettivo per riga: override manuale se presente, altrimenti quello riconosciuto automaticamente
+  function effectiveArticle(row, i) {
+    if (Object.prototype.hasOwnProperty.call(overrides, i)) {
+      if (overrides[i] === '') return null;
+      return db.articles.find(a => a.id === overrides[i]) || null;
+    }
+    return row.matched;
+  }
+
+  const rowsWithArticle = (rows || []).map((r, i) => ({ ...r, effective: effectiveArticle(r, i) }));
+  const matchedRows = rowsWithArticle.filter(r => r.effective);
+  const unmatchedRows = rowsWithArticle.filter(r => !r.effective);
+  const activeArticles = db.articles.filter(a => a.attivo !== false).sort((a, b) => (a.descrizione || '').localeCompare(b.descrizione || ''));
+
+  function confirmImport() {
+    if (matchedRows.length === 0) { showToast('Nessun articolo riconosciuto da importare', 'error'); return; }
+    const refId = uid();
+    const usedDates = matchedRows.map(r => r.rowDate).sort();
+    const periodoDa = usedDates[0];
+    const periodoA = usedDates[usedDates.length - 1];
+    const periodoLabelTxt = periodoDa === periodoA ? periodoDa : `dal ${periodoDa} al ${periodoA}`;
+    const next = { ...db, movements: [...db.movements], stock: { ...db.stock }, posAliases: { ...db.posAliases } };
+    matchedRows.forEach(r => {
+      const key = stockKey(wh, r.effective.id);
+      next.stock[key] = (next.stock[key] || 0) - r.qty;
+      next.movements.push({
+        id: uid(), refId, date: r.rowDate, periodoDa, periodoA,
+        type: 'scarico', articleId: r.effective.id, wh, whFrom: wh, whTo: null,
+        qty: r.qty, prezzoAcquisto: r.effective.prezzoAcquisto || 0,
+        note: `Vendite importate da file "${fileName}" (${periodoLabelTxt})`, createdAt: Date.now()
+      });
+      // memorizza/aggiorna la corrispondenza per riconoscerla automaticamente nei prossimi import
+      const key2 = normalizeMatchText(r.descrizioneFile);
+      if (key2) next.posAliases[key2] = r.effective.id;
+    });
+    persist(next);
+    showToast(`Vendite importate: ${matchedRows.length} righe scaricate${unmatchedRows.length ? `, ${unmatchedRows.length} da abbinare` : ''}`);
+    onClose();
+  }
+
+  return (
+    <Modal title="Importa vendite da report cassa" onClose={onClose} wide>
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <Field label="Chiosco">
+          <select className={inputCls} value={wh} onChange={e => setWh(e.target.value)}>
+            {WAREHOUSES.filter(w => w.id !== 'generale').map(w => <option key={w.id} value={w.id}>{w.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Dal (riferimento)">
+          <input type="date" className={inputCls} value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+        </Field>
+        <Field label="Al (riferimento)">
+          <input type="date" className={inputCls} value={dateTo} onChange={e => setDateTo(e.target.value)} />
+        </Field>
+      </div>
+
+      <div className="mb-4 border-2 border-dashed border-slate-300 rounded-lg p-4 text-center">
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="text-xs" />
+        <div className="text-[11px] text-slate-400 mt-1">
+          File Excel/CSV con colonne Codice/EAN/Descrizione, Quantità e (se presente) Data — se il file riporta la data riga per riga viene usata quella; "Dal/Al" servono anche per correggere automaticamente eventuali date ambigue nel file (es. giorno/mese invertiti).
+        </div>
+      </div>
+
+      {rows && (
+        <>
+          <div className="flex gap-4 text-xs mb-2">
+            <span className="text-emerald-700 font-medium">{matchedRows.length} righe riconosciute</span>
+            {unmatchedRows.length > 0 && <span className="text-red-600 font-medium">{unmatchedRows.length} da abbinare manualmente</span>}
+          </div>
+          <div className="text-[11px] text-slate-400 mb-2">
+            Puoi correggere qualsiasi riga scegliendo l'articolo giusto dal menu — l'app ricorderà la corrispondenza per i prossimi import.
+          </div>
+          <div className="max-h-80 overflow-y-auto border border-slate-200 rounded-lg mb-4">
+            <table className="w-full text-xs">
+              <thead className="bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0">
+                <tr>
+                  <th className="text-left px-2 py-1.5">Data</th>
+                  <th className="text-left px-2 py-1.5">Da file cassa</th>
+                  <th className="text-left px-2 py-1.5 w-56">Articolo gestionale</th>
+                  <th className="text-right px-2 py-1.5">Venduto</th>
+                  <th className="text-right px-2 py-1.5">Giacenza dopo</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rowsWithArticle.map((r, i) => {
+                  const giacenzaAttuale = r.effective ? getQty(db, wh, r.effective.id) : null;
+                  const after = r.effective ? giacenzaAttuale - r.qty : null;
+                  const selectValue = Object.prototype.hasOwnProperty.call(overrides, i) ? overrides[i] : (r.matched ? r.matched.id : '');
+                  return (
+                    <tr key={i} className={`border-t border-slate-100 ${!r.effective ? 'bg-red-50' : ''}`}>
+                      <td className="px-2 py-1.5 whitespace-nowrap">{r.rowDate}</td>
+                      <td className="px-2 py-1.5">{r.codiceFile} {r.descrizioneFile}</td>
+                      <td className="px-2 py-1.5">
+                        <select
+                          className="w-full border border-slate-300 rounded px-1.5 py-1 text-xs"
+                          value={selectValue}
+                          onChange={e => setOverrides(o => ({ ...o, [i]: e.target.value }))}
+                        >
+                          <option value="">— Non abbinato —</option>
+                          {activeArticles.map(a => (
+                            <option key={a.id} value={a.id}>{a.codice} — {a.descrizione}</option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="px-2 py-1.5 text-right">{fmtNum(r.qty)}</td>
+                      <td className={`px-2 py-1.5 text-right font-medium ${after !== null && after < 0 ? 'text-red-600' : ''}`}>
+                        {after !== null ? fmtNum(after) : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      <div className="flex justify-end gap-2">
+        <button className={btnSecondary} onClick={onClose}>Annulla</button>
+        <button className={btnPrimary} onClick={confirmImport} disabled={!rows || matchedRows.length === 0}>
+          <Check size={14} /> Conferma scarico ({matchedRows.length})
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 /* ============================== INVENTARIO ============================== */
 
 function InventarioTab({ db, persist, showToast, askConfirm }) {
@@ -2101,3 +2682,6 @@ function ExportJsonModal({ db, onClose, showToast }) {
   );
 }
 
+
+
+ 
